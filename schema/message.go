@@ -390,17 +390,61 @@ type ResponseMeta struct {
 	LogProbs *LogProbs `json:"logprobs,omitempty"`
 }
 
+// Message denotes the data structure for model input and output, originating from either user input or model return.
+// It supports both text-only and multimodal content.
+//
+// For text-only input from a user, use the Content field:
+//
+//	&schema.Message{
+//		Role:    schema.User,
+//		Content: "What is the capital of France?",
+//	}
+//
+// For multimodal input from a user, use the UserInputMultiContent field.
+// This allows combining text with other media like images:
+//
+//	&schema.Message{
+//		Role: schema.User,
+//		UserInputMultiContent: []schema.MessageInputPart{
+//			{Type: schema.ChatMessagePartTypeText, Text: "What is in this image?"},
+//			{Type: schema.ChatMessagePartTypeImageURL, Image: &schema.MessageInputImage{
+//				MessagePartCommon: schema.MessagePartCommon{
+//					URL: toPtr("https://example.com/cat.jpg"),
+//				},
+//				Detail: schema.ImageURLDetailHigh,
+//			}},
+//		},
+//	}
+//
+// When the model returns multimodal content, it is available in the AssistantGenMultiContent field:
+//
+//	&schema.Message{
+//		Role: schema.Assistant,
+//		AssistantGenMultiContent: []schema.MessageOutputPart{
+//			{Type: schema.ChatMessagePartTypeText, Text: "Here is the generated image:"},
+//			{Type: schema.ChatMessagePartTypeImage, Image: &schema.MessageOutputImage{
+//				MessagePartCommon: schema.MessagePartCommon{
+//					Base64Data: toPtr("base64_image_binary"),
+//					MIMEType:   "image/png",
+//				},
+//			}},
+//		},
+//	}
 type Message struct {
-	Role    RoleType `json:"role"`
-	Content string   `json:"content"`
+	Role RoleType `json:"role"`
+
+	// Content is for user text input and model text output.
+	Content string `json:"content"`
 
 	// if MultiContent is not empty, use this instead of Content
 	// if MultiContent is empty, use Content
-	// Deprecated: will no longer be maintained use UserInputMultiContent instead.
+	// Deprecated: Use UserInputMultiContent for user multimodal inputs and AssistantGenMultiContent for model multimodal outputs.
 	MultiContent []ChatMessagePart `json:"multi_content,omitempty"`
 
+	// UserInputMultiContent passes multimodal content provided by the user to the model.
 	UserInputMultiContent []MessageInputPart `json:"user_input_multi_content,omitempty"`
 
+	// AssistantGenMultiContent is for receiving multimodal output from the model.
 	AssistantGenMultiContent []MessageOutputPart `json:"assistant_output_multi_content,omitempty"`
 
 	Name string `json:"name,omitempty"`
@@ -558,19 +602,35 @@ func (m *Message) Format(_ context.Context, vs map[string]any, formatType Format
 	copied := *m
 	copied.Content = c
 
-	if len(m.MultiContent) != 0 {
-		copied.MultiContent = make([]ChatMessagePart, len(m.MultiContent))
-		copy(copied.MultiContent, m.MultiContent)
+	if len(m.MultiContent) > 0 {
+		copied.MultiContent, err = formatMultiContent(m.MultiContent, vs, formatType)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	for i, mc := range copied.MultiContent {
+	if len(m.UserInputMultiContent) > 0 {
+		copied.UserInputMultiContent, err = formatUserInputMultiContent(m.UserInputMultiContent, vs, formatType)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return []*Message{&copied}, nil
+}
+
+func formatMultiContent(multiContent []ChatMessagePart, vs map[string]any, formatType FormatType) ([]ChatMessagePart, error) {
+	copiedMC := make([]ChatMessagePart, len(multiContent))
+	copy(copiedMC, multiContent)
+
+	for i, mc := range copiedMC {
 		switch mc.Type {
 		case ChatMessagePartTypeText:
 			nmc, err := formatContent(mc.Text, vs, formatType)
 			if err != nil {
 				return nil, err
 			}
-			copied.MultiContent[i].Text = nmc
+			copiedMC[i].Text = nmc
 		case ChatMessagePartTypeImageURL:
 			if mc.ImageURL == nil {
 				continue
@@ -579,7 +639,7 @@ func (m *Message) Format(_ context.Context, vs map[string]any, formatType Format
 			if err != nil {
 				return nil, err
 			}
-			copied.MultiContent[i].ImageURL.URL = url
+			copiedMC[i].ImageURL.URL = url
 		case ChatMessagePartTypeAudioURL:
 			if mc.AudioURL == nil {
 				continue
@@ -588,7 +648,7 @@ func (m *Message) Format(_ context.Context, vs map[string]any, formatType Format
 			if err != nil {
 				return nil, err
 			}
-			copied.MultiContent[i].AudioURL.URL = url
+			copiedMC[i].AudioURL.URL = url
 		case ChatMessagePartTypeVideoURL:
 			if mc.VideoURL == nil {
 				continue
@@ -597,7 +657,7 @@ func (m *Message) Format(_ context.Context, vs map[string]any, formatType Format
 			if err != nil {
 				return nil, err
 			}
-			copied.MultiContent[i].VideoURL.URL = url
+			copiedMC[i].VideoURL.URL = url
 		case ChatMessagePartTypeFileURL:
 			if mc.FileURL == nil {
 				continue
@@ -606,10 +666,101 @@ func (m *Message) Format(_ context.Context, vs map[string]any, formatType Format
 			if err != nil {
 				return nil, err
 			}
-			copied.MultiContent[i].FileURL.URL = url
+			copiedMC[i].FileURL.URL = url
 		}
 	}
-	return []*Message{&copied}, nil
+
+	return copiedMC, nil
+}
+
+func formatUserInputMultiContent(userInputMultiContent []MessageInputPart, vs map[string]any, formatType FormatType) ([]MessageInputPart, error) {
+	copiedUIMC := make([]MessageInputPart, len(userInputMultiContent))
+	copy(copiedUIMC, userInputMultiContent)
+
+	for i, uimc := range copiedUIMC {
+		switch uimc.Type {
+		case ChatMessagePartTypeText:
+			text, err := formatContent(uimc.Text, vs, formatType)
+			if err != nil {
+				return nil, err
+			}
+			copiedUIMC[i].Text = text
+		case ChatMessagePartTypeImageURL:
+			if uimc.Image == nil {
+				continue
+			}
+			if uimc.Image.URL != nil && *uimc.Image.URL != "" {
+				url, err := formatContent(*uimc.Image.URL, vs, formatType)
+				if err != nil {
+					return nil, err
+				}
+				copiedUIMC[i].Image.URL = &url
+			}
+			if uimc.Image.Base64Data != nil && *uimc.Image.Base64Data != "" {
+				base64data, err := formatContent(*uimc.Image.Base64Data, vs, formatType)
+				if err != nil {
+					return nil, err
+				}
+				copiedUIMC[i].Image.Base64Data = &base64data
+			}
+		case ChatMessagePartTypeAudioURL:
+			if uimc.Audio == nil {
+				continue
+			}
+			if uimc.Audio.URL != nil && *uimc.Audio.URL != "" {
+				url, err := formatContent(*uimc.Audio.URL, vs, formatType)
+				if err != nil {
+					return nil, err
+				}
+				copiedUIMC[i].Audio.URL = &url
+			}
+			if uimc.Audio.Base64Data != nil && *uimc.Audio.Base64Data != "" {
+				base64data, err := formatContent(*uimc.Audio.Base64Data, vs, formatType)
+				if err != nil {
+					return nil, err
+				}
+				copiedUIMC[i].Audio.Base64Data = &base64data
+			}
+		case ChatMessagePartTypeVideoURL:
+			if uimc.Video == nil {
+				continue
+			}
+			if uimc.Video.URL != nil && *uimc.Video.URL != "" {
+				url, err := formatContent(*uimc.Video.URL, vs, formatType)
+				if err != nil {
+					return nil, err
+				}
+				copiedUIMC[i].Video.URL = &url
+			}
+			if uimc.Video.Base64Data != nil && *uimc.Video.Base64Data != "" {
+				base64data, err := formatContent(*uimc.Video.Base64Data, vs, formatType)
+				if err != nil {
+					return nil, err
+				}
+				copiedUIMC[i].Video.Base64Data = &base64data
+			}
+		case ChatMessagePartTypeFileURL:
+			if uimc.File == nil {
+				continue
+			}
+			if uimc.File.URL != nil && *uimc.File.URL != "" {
+				url, err := formatContent(*uimc.File.URL, vs, formatType)
+				if err != nil {
+					return nil, err
+				}
+				copiedUIMC[i].File.URL = &url
+			}
+			if uimc.File.Base64Data != nil && *uimc.File.Base64Data != "" {
+				base64data, err := formatContent(*uimc.File.Base64Data, vs, formatType)
+				if err != nil {
+					return nil, err
+				}
+				copiedUIMC[i].File.Base64Data = &base64data
+			}
+		}
+	}
+
+	return copiedUIMC, nil
 }
 
 // String returns the string representation of the message.

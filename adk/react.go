@@ -31,6 +31,7 @@ var ErrExceedMaxIterations = errors.New("exceeds max iterations")
 type State struct {
 	Messages []Message
 
+	HasReturnDirectly        bool
 	ReturnDirectlyToolCallID string
 
 	ToolGenActions map[string]*AgentAction
@@ -83,6 +84,8 @@ type reactConfig struct {
 	agentName string
 
 	maxIterations int
+
+	beforeChatModel, afterChatModel []func(context.Context, *ChatModelAgentState) error
 }
 
 func genToolInfos(ctx context.Context, config *compose.ToolsNodeConfig) ([]*schema.ToolInfo, error) {
@@ -103,16 +106,18 @@ type reactGraph = *compose.Graph[[]Message, Message]
 type sToolNodeOutput = *schema.StreamReader[[]Message]
 type sGraphOutput = MessageStream
 
-func getReturnDirectlyToolCallID(ctx context.Context) string {
+func getReturnDirectlyToolCallID(ctx context.Context) (string, bool) {
 	var toolCallID string
+	var hasReturnDirectly bool
 	handler := func(_ context.Context, st *State) error {
 		toolCallID = st.ReturnDirectlyToolCallID
+		hasReturnDirectly = st.HasReturnDirectly
 		return nil
 	}
 
 	_ = compose.ProcessState(ctx, handler)
 
-	return toolCallID
+	return toolCallID, hasReturnDirectly
 }
 
 func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
@@ -158,24 +163,39 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 		}
 		st.RemainingIterations--
 
-		st.Messages = append(st.Messages, input...)
+		s := &ChatModelAgentState{Messages: append(st.Messages, input...)}
+		for _, b := range config.beforeChatModel {
+			err = b(ctx, s)
+			if err != nil {
+				return nil, err
+			}
+		}
+		st.Messages = s.Messages
+
 		return st.Messages, nil
 	}
+	modelPostHandle := func(ctx context.Context, input Message, st *State) (Message, error) {
+		s := &ChatModelAgentState{Messages: append(st.Messages, input)}
+		for _, a := range config.afterChatModel {
+			err = a(ctx, s)
+			if err != nil {
+				return nil, err
+			}
+		}
+		st.Messages = s.Messages
+		return input, nil
+	}
 	_ = g.AddChatModelNode(chatModel_, chatModel,
-		compose.WithStatePreHandler(modelPreHandle), compose.WithNodeName(chatModel_))
+		compose.WithStatePreHandler(modelPreHandle), compose.WithStatePostHandler(modelPostHandle), compose.WithNodeName(chatModel_))
 
 	toolPreHandle := func(ctx context.Context, input Message, st *State) (Message, error) {
-		if input != nil {
-			// isn't resume
-			st.Messages = append(st.Messages, input)
-		}
-
 		input = st.Messages[len(st.Messages)-1]
 		if len(config.toolsReturnDirectly) > 0 {
 			for i := range input.ToolCalls {
 				toolName := input.ToolCalls[i].Function.Name
 				if config.toolsReturnDirectly[toolName] {
 					st.ReturnDirectlyToolCallID = input.ToolCalls[i].ID
+					st.HasReturnDirectly = true
 				}
 			}
 		}
@@ -216,7 +236,7 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 		)
 
 		cvt := func(ctx context.Context, sToolCallMessages sToolNodeOutput) (sGraphOutput, error) {
-			id := getReturnDirectlyToolCallID(ctx)
+			id, _ := getReturnDirectlyToolCallID(ctx)
 
 			return schema.StreamReaderWithConvert(sToolCallMessages,
 				func(in []Message) (Message, error) {
@@ -238,9 +258,9 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 		checkReturnDirect := func(ctx context.Context,
 			sToolCallMessages sToolNodeOutput) (string, error) {
 
-			id := getReturnDirectlyToolCallID(ctx)
+			_, ok := getReturnDirectlyToolCallID(ctx)
 
-			if len(id) != 0 {
+			if ok {
 				return toolNodeToEndConverter, nil
 			}
 

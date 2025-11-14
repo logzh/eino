@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -754,20 +755,6 @@ func TestToolRerun(t *testing.T) {
 
 	tc := []schema.ToolCall{
 		{
-			ID: "1",
-			Function: schema.FunctionCall{
-				Name:      "tool1",
-				Arguments: "input",
-			},
-		},
-		{
-			ID: "2",
-			Function: schema.FunctionCall{
-				Name:      "tool2",
-				Arguments: "input",
-			},
-		},
-		{
 			ID: "3",
 			Function: schema.FunctionCall{
 				Name:      "tool3",
@@ -778,6 +765,20 @@ func TestToolRerun(t *testing.T) {
 			ID: "4",
 			Function: schema.FunctionCall{
 				Name:      "tool4",
+				Arguments: "input",
+			},
+		},
+		{
+			ID: "1",
+			Function: schema.FunctionCall{
+				Name:      "tool1",
+				Arguments: "input",
+			},
+		},
+		{
+			ID: "2",
+			Function: schema.FunctionCall{
+				Name:      "tool2",
 				Arguments: "input",
 			},
 		},
@@ -794,9 +795,18 @@ func TestToolRerun(t *testing.T) {
 		return state.In, nil
 	})))
 	assert.NoError(t, g.AddLambdaNode("lambda", InvokableLambda(func(ctx context.Context, input []*schema.Message) (output string, err error) {
-		sb := strings.Builder{}
+		contents := make([]string, len(input))
 		for _, m := range input {
-			sb.WriteString(m.Content)
+			callID := m.ToolCallID
+			callIDInt, err := strconv.Atoi(callID)
+			if err != nil {
+				return "", err
+			}
+			contents[callIDInt-1] = m.Content
+		}
+		sb := strings.Builder{}
+		for _, m := range contents {
+			sb.WriteString(m)
 		}
 		return sb.String(), nil
 	})))
@@ -826,6 +836,69 @@ func TestToolRerun(t *testing.T) {
 	result, err := concatStreamReader(sr)
 	assert.NoError(t, err)
 	assert.Equal(t, "tool1 input: inputtool2 input: inputtool3 input: inputtool4 input: input", result)
+}
+
+func TestToolMiddleware(t *testing.T) {
+	ctx := context.Background()
+	t3 := &myTool3{t: t}
+	t4 := &myTool4{t: t}
+	tn, err := NewToolNode(ctx, &ToolsNodeConfig{
+		Tools: []tool.BaseTool{t3, t4},
+		ToolCallMiddlewares: []ToolMiddleware{
+			{
+				Invokable: func(endpoint InvokableToolEndpoint) InvokableToolEndpoint {
+					return func(ctx context.Context, input *ToolInput) (*ToolOutput, error) {
+						_, err := endpoint(ctx, input)
+						if err != nil {
+							return nil, err
+						}
+						return &ToolOutput{Result: "middleware1"}, nil
+					}
+				},
+			},
+			{
+				Streamable: func(endpoint StreamableToolEndpoint) StreamableToolEndpoint {
+					return func(ctx context.Context, input *ToolInput) (*StreamToolOutput, error) {
+						_, err := endpoint(ctx, input)
+						if err != nil {
+							return nil, err
+						}
+						return &StreamToolOutput{Result: schema.StreamReaderFromArray([]string{"middleware2"})}, nil
+					}
+				},
+			},
+		},
+	})
+	assert.NoError(t, err)
+
+	messages, err := tn.Invoke(ctx, schema.AssistantMessage("", []schema.ToolCall{
+		{ID: "1", Function: schema.FunctionCall{Name: "tool3", Arguments: ""}},
+		{ID: "2", Function: schema.FunctionCall{Name: "tool4", Arguments: ""}},
+	}))
+	assert.NoError(t, err)
+	assert.Len(t, messages, 2)
+	assert.Equal(t, "middleware1", messages[0].Content)
+	assert.Equal(t, "middleware2", messages[1].Content)
+
+	t3.times, t4.times = 0, 0 // reset t3 t4
+	messageStreams, err := tn.Stream(ctx, schema.AssistantMessage("", []schema.ToolCall{
+		{ID: "1", Function: schema.FunctionCall{Name: "tool3", Arguments: ""}},
+		{ID: "2", Function: schema.FunctionCall{Name: "tool4", Arguments: ""}},
+	}))
+	assert.NoError(t, err)
+	var messageArray [][]*schema.Message
+	for {
+		chunk, err := messageStreams.Recv()
+		if err == io.EOF {
+			break
+		}
+		assert.NoError(t, err)
+		messageArray = append(messageArray, chunk)
+	}
+	messages, err = schema.ConcatMessageArray(messageArray)
+	assert.Len(t, messages, 2)
+	assert.Equal(t, "middleware1", messages[0].Content)
+	assert.Equal(t, "middleware2", messages[1].Content)
 }
 
 type myTool1 struct {
