@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/bytedance/sonic"
+
 	"github.com/cloudwego/eino/compose"
 
 	"github.com/cloudwego/eino/adk"
@@ -32,6 +33,10 @@ import (
 	"github.com/cloudwego/eino/internal/safe"
 	"github.com/cloudwego/eino/schema"
 )
+
+func init() {
+	schema.RegisterName[*defaultPlan]("_eino_adk_plan_execute_default_plan")
+}
 
 // Plan represents an execution plan with a sequence of actionable steps.
 // It supports JSON serialization and deserialization while providing access to the first step.
@@ -379,6 +384,9 @@ func (p *planner) Run(ctx context.Context, input *adk.AgentInput,
 				compose.InvokableLambda(func(ctx context.Context, msg adk.Message) (plan Plan, err error) {
 					var planJSON string
 					if p.toolCall {
+						if len(msg.ToolCalls) == 0 {
+							return nil, fmt.Errorf("no tool call")
+						}
 						planJSON = msg.ToolCalls[0].Function.Arguments
 					} else {
 						planJSON = msg.Content
